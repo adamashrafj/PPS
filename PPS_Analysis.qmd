@@ -1,0 +1,1387 @@
+---
+title: "Hospital Sungai Buloh PPS 2024"
+description: |
+  Data Manipulation and Analysis for Hospital Sungai Buloh, Point Prevalence Survey,(PPS) 2024.
+author:
+  - first_name: Adam 
+    last_name: Jaafer, PharmD
+    affiliation: Sungai Buloh Hospital
+  - first_name: Izyana Munirah 
+    last_name: Idham, MClinPharm
+    affiliation: Sungai Buloh Hospital
+  - first_name: Hannah
+    last_name: Mahir, MClinPharm
+    affiliation: Sungai Buloh Hospital
+  - first_name: Fong
+    last_name: Siew Li, BPharm
+    affiliation: Sungai Buloh Hospital
+date: "`r Sys.Date()`"
+
+output: 
+ distill::distill_article:
+    toc: true
+    code_folding: false
+    self_contained: false
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-float: true
+    toc-location: left
+---
+
+<!--------------- my typical setup ----------------->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+# VARIABLES MANAGEMENT IN EXCEL
+
+## Steps to Prepare Data in Excel before R wrangling (Macro available)
+
+1.  Power query data from PPS in AMS folder (refer Power Query guide)
+2.  Missing Data Management
+    -   Remove ERROR, #REF! and #N/A using find and replace ALL
+    -   Double check missing data cell
+    -   DO NOT PUT NA during data entry
+3.  Remove Duplicate patients
+    -   Conditional formatting \> Highlight cell rules \> Duplicate values
+    -   Sort by Date (oldest to newest)
+    -   Remove latest entries (keep older entries)
+    -   Readjust SORT column
+4.  Save file as excel **workbook** named "HSGB_PPS" in PPS HSGB/Data Analysis/R folder
+5.  Make sure in folder /excel/ contains 3 excel files:
+    -   FINALPPSbyABX_202X.xlsx (file from previous year)
+    -   traffic.xlsx
+    -   Prevalence_analysis_202X.xlsx (file from previous year)
+
+# DATA CLEANUP
+
+## Load libraries & setup working directories and folders
+
+```{r library}
+pacman::p_load(
+     rio,          # import function without /
+     purrr,        # iteration
+     tidyverse,    # data management and visualization
+     writexl,      # write Excel file with multiple sheets
+     readxl,        # import Excel with multiple sheets
+     here,          # make calling folders 
+     kableExtra,   #create awesome table in HTML
+     lubridate,    # date manipulation
+     reshape2,     # melt fucntion
+     janitor,       # data cleaning
+     forcats,      # data categorisation
+     scales,       # data cleaning
+     gtsummary,    # data presentation/table1
+     ggplot2,       # dataviz
+     glue          # glue syntax
+)
+
+#set working directories
+setwd(here::here())
+getwd()
+
+# Create the output folder if it doesn't exist
+if (!dir.exists("table")) dir.create("table") #to store tables
+if (!dir.exists("image")) dir.create("image") #to store images
+
+```
+
+## Load and Clean PPS Current Year data into R
+
+```{r load main data}
+
+library(readxl)
+PPS <- read_excel("HSGB_PPS.xlsx", 
+    sheet = "Patient & Abx Data ") #select excel workbook and sheet
+
+#Remove Line breaks, SPACE, symbols such as '(', ')', '\~?', '.', and '/'
+    #-   replace with underscore
+
+PPS <- clean_names(PPS) %>% #clean data (remove whitespace, duplicate headers, unwanted characters etc)
+ rowid_to_column("SORT") #add row_ID in sequence
+  
+write_xlsx(PPS, "excel/PPS_raw.xlsx") #double check with excel
+
+#extracting LATEST YEAR
+str(PPS$audit_date)
+latest_year <- year(PPS$audit_date[1])
+second_latest_year <- latest_year - 1
+nrow_PPS <- nrow(PPS)
+```
+
+## Updating Data for prevalance analysis & Load into R
+
+Additional excel sheet needs to be updated from previous PPS
+
+Prevalence_analysis - column = year, antibiotics_prescribed (yes/no), compliance - to be updated using prevalence data of total patient in ward and patient on antibiotics - by pt
+
+```{r updating prevalence sheet}
+
+pt_on_abx <- read_excel("HSGB_PPS.xlsx", sheet = "Ward Data", range = "J4", col_names = FALSE) #extrating pt on abx from ward_data sheet (from cell J4 = number of pt on ABX)
+pt_not_abx <- read_excel("HSGB_PPS.xlsx", sheet = "Ward Data", range = "K4", col_names = FALSE) #extrating pt not on abx from ward_data sheet (from cell K4 = number of pt NOT on ABX)
+
+no_pt_on_abx <- pt_on_abx[[1,1]] #assign var as value
+no_pt_not_abx <- pt_not_abx[[1,1]] #assign var as value
+
+if (nrow_PPS != no_pt_on_abx) {
+  stop("Mismatch!")
+}
+
+# Sample data (patients with prescribed antibiotics and not prescribed)
+df_prev <- tibble(
+  id = 1:(no_pt_on_abx + no_pt_not_abx),
+  Abx_prescribed = c(rep("Yes", no_pt_on_abx), rep("No", no_pt_not_abx)),  #df of prevalence abx prescribed of that year
+  Year = latest_year) #year need to change!
+
+#create df of compliance to guideline to be merged later
+df_prev1 <- PPS %>% 
+  mutate(
+    Compliance = case_when(
+      overall_compliance_to_antibiotic_guideline == "Compliant to guidelines" ~ "yes",
+      overall_compliance_to_antibiotic_guideline == "Not-compliant to guidelines" ~ "no",
+      overall_compliance_to_antibiotic_guideline == "NA" ~ "na",  # Assuming 'na' is a string, not actual NA
+      is.na(overall_compliance_to_antibiotic_guideline) ~ "NA",  # Handling actual NA values
+      TRUE ~ as.character(overall_compliance_to_antibiotic_guideline)  # Leave other values unchanged
+    )
+  ) %>%
+  select(Compliance)
+
+#dummy df for cell value of compliance
+compliance_counts <- df_prev1 %>%
+  count(Compliance) %>%
+  spread(Compliance, n, fill = 0)
+
+# Assigning variables for compliance counts from the summarized dataset
+compliance_yes_count <- compliance_counts$yes
+compliance_no_count <- compliance_counts$no
+compliance_unknown_count <- compliance_counts$na
+compliance_notavail_count <- pt_not_abx[[1,1]]
+
+#validation 
+total_compliance_needed <- sum(df_prev$Abx_prescribed == "Yes")
+total_compliance_provided <- compliance_yes_count + compliance_no_count + compliance_unknown_count
+total <- compliance_yes_count + compliance_no_count + compliance_unknown_count + compliance_notavail_count
+
+if (total_compliance_needed != total_compliance_provided) {
+  stop("Mismatch between number of 'yes' abx_prescribed and total compliance counts.")
+}
+
+compliance_vector <- sample(
+  c(rep("yes", compliance_yes_count), 
+    rep("no", compliance_no_count), 
+    rep("na", compliance_unknown_count))
+)
+
+length(compliance_vector)
+# Adjusting the compliance distribution based on counts from the summary
+df_prev2 <- df_prev %>%
+  filter(Abx_prescribed == "Yes") %>%
+  mutate(Compliance = if_else(
+    Abx_prescribed == "Yes", 
+    compliance_vector,               # Exact match for 'yes' rows
+    "NotAvail"          # Default NA for any missing data
+  ))
+
+new_prev_analysis <- df_prev %>%
+  left_join(df_prev2, suffix = c("", ".new")) %>%
+  mutate(Compliance = ifelse(is.na(Compliance), "NotAvail", Compliance)) %>%
+  mutate(across(where(is.character), tolower)) %>%
+  select(Year, Abx_prescribed, Compliance)
+
+#NEXT STEP IS TO COMBINE CURRENT DATA TO EXISTING SPREADSHEET
+
+#load available prevalence_analysis.xlsx
+existing_prev_analysis <- read_excel(paste0("excel/Prevalence_analysis_", second_latest_year, ".xlsx"))
+
+#validation of rows in current prevalence sheet
+new_rows <- anti_join(new_prev_analysis, existing_prev_analysis, by = c("Year", "Abx_prescribed", "Compliance"))
+
+#join existing + new prevalence analysis into one spreadsheet
+combined_prev_analysis <- bind_rows(existing_prev_analysis, new_rows)
+
+#save to excel sheet
+write_xlsx(combined_prev_analysis, paste0("excel/Prevalence_analysis_", latest_year, ".xlsx"))
+```
+```{r remove variables}
+rm(pt_on_abx, pt_not_abx, df_prev,df_prev1, df_prev2, compliance_counts, compliance_vector, new_prev_analysis, existing_prev_analysis, new_rows)
+
+rm(nrow_PPS,total_compliance_needed, total_compliance_provided, compliance_no_count, compliance_notavail_count, compliance_unknown_count, compliance_yes_count)
+```
+
+## View Data frame
+
+```{r data, R.options = list(width = 100)}
+glimpse(PPS)
+```
+
+```{r data2, R.options = list(width = 100), results='hide'}
+
+options(width = 60)
+skimr::skim(PPS) %>%
+  kable() %>%
+  kable_paper(bootstrap_options = "striped", full_width = F, position = "center")
+```
+
+# PIVOT LONGER USING MELT
+
+## Manipulate PPS DATA from wide to long - using reshape2 library
+
+Separate melt for each columns from HSGB_PPS excel sheet
+
+```{r melting antibiotic name}
+options(width = 60)
+melt_abxname <-
+  PPS %>% 
+  select(pt_reg_no, #control
+         SORT, #control
+         discipline, #control
+         antibiotic_1_name, #will be melted
+         antibiotic_2_name, #will be melted
+         antibiotic_3_name, #will be melted
+         antibiotic_4_name) %>% #will be melted
+  melt(id=c("pt_reg_no" ,"SORT","discipline")) %>% #melt data stratify by pt reg no and SORT
+  arrange(SORT) %>% #re arrange based on SBnumber
+  filter(!is.na(value)) %>% #filter out NA in value column
+  dplyr::rename(SBNUMBER = pt_reg_no, ABX1 = variable, ABX_NAME = value) %>% #rename column names
+  select(-c(ABX1)) #remove column ABX1
+
+kable(head(melt_abxname))
+```
+
+```{r melt antibiotic indication}
+options(width = 60)
+melt_indication <-
+  PPS %>% 
+  select(pt_reg_no, #control
+         SORT, #control
+         antibiotic_1_indication, #will be melted
+         antibiotic_2_indication, #will be melted
+         antibiotic_3_indication, #will be melted
+         antibiotic_4_indication) %>% #will be melted
+  melt(id=c("pt_reg_no","SORT")) %>% #melt data stratify by pt reg no and SORT
+  arrange(SORT) %>% #re arrange based on SBnumber
+  filter(!is.na(value)) %>% #filter out NA in value column
+  dplyr::rename(SBNUMBER = pt_reg_no,
+         ABX1 = variable,
+         INDICATION = value) %>% #rename column names
+  select(-c(ABX1)) #remove column ABX1
+
+kable(head(melt_indication))
+```
+
+```{r melt indication by  group}
+options(width = 60)
+melt_diseasegroup <-
+  PPS %>% 
+  select(pt_reg_no, #control
+         SORT, #control
+         antibiotic_1_infection_disease_group_by_system, #will be melted
+         antibiotic_2_infection_disease_group_by_system, #will be melted
+         antibiotic_3_infection_disease_group_by_system, #will be melted
+         antibiotic_4_infection_disease_group_by_system) %>% #will be melted
+  melt(id=c("pt_reg_no","SORT")) %>% #melt data stratify by pt reg no and SORT
+  arrange(SORT) %>% #re arrange based on SBnumber
+  filter(!is.na(value)) %>% #filter out NA in value column
+  dplyr::rename(SBNUMBER = pt_reg_no,
+         ABX1 = variable,
+         IND_DIS_GROUP = value) %>% #rename column names
+  select(-c(ABX1)) #remove column ABX1
+
+kable(head(melt_diseasegroup))
+```
+
+```{r melt indication type}
+options(width = 60)
+melt_typeind <-
+  PPS %>% 
+  select(pt_reg_no, #control
+         SORT, #control
+         antibiotic_1_infection_disease_type, #will be melted
+         antibiotic_2_infection_disease_type, #will be melted
+         antibiotic_3_infection_disease_type, #will be melted
+         antibiotic_4_infection_disease_type) %>% #will be melted
+  melt(id=c("pt_reg_no" , "SORT")) %>% #melt data stratify by pt reg no and SORT
+  arrange(SORT) %>% #re arrange based on SBnumber
+  filter(!is.na(value)) %>% #filter out NA in value column
+  dplyr::rename(SBNUMBER = pt_reg_no,
+         ABX1 = variable,
+         TYPE_INDICATION = value) %>% #rename column names
+  select(-c(ABX1)) #remove column ABX1
+
+kable(head(melt_typeind))
+```
+
+```{r melt category}
+options(width = 60)
+melt_category <-
+  PPS %>% 
+  select(pt_reg_no, #control
+         SORT, #control
+         antibiotic_1_indication_category, #will be melted
+         antibiotic_2_indication_category, #will be melted
+         antibiotic_3_indication_category, #will be melted
+         antibiotic_4_indication_category) %>% #will be melted
+  melt(id=c("pt_reg_no" , "SORT")) %>% #melt data stratify by pt reg no and SORT
+  arrange(SORT) %>% #re arrange based on SBnumber
+  filter(!is.na(value)) %>% #filter out NA in value column 
+  dplyr::rename(SBNUMBER = pt_reg_no,
+         ABX1 = variable,
+         CATEGORY = value) %>% #rename column names
+  select(-c(ABX1)) #remove column ABX1
+
+kable(head(melt_category))
+
+```
+
+```{r melt indication documented}
+options(width = 60)
+melt_inddocumented <-
+  PPS %>% 
+  select(pt_reg_no, #control
+         SORT, #control
+         antibiotic_1_indication_documented_within_24_h, #will be melted
+         antibiotic_2_indication_documented_within_24_h, #will be melted
+         antibiotic_3_indication_documented_within_24_h, #will be melted
+         antibiotic_4_indication_documented_within_24_h) %>% #will be melted
+  melt(id=c("pt_reg_no" , "SORT")) %>% #melt data stratify by pt reg no and SORT
+  arrange(SORT) %>% #re arrange based on SBnumber
+  filter(!is.na(value)) %>% #filter out NA in value column 
+  dplyr::rename(SBNUMBER = pt_reg_no,
+         ABX1 = variable,
+         DOCUMENTED = value) %>% #rename column names
+  select(-c(ABX1)) #remove column ABX1
+
+kable(head(melt_inddocumented))
+```
+
+```{r melt compliance to guideline}
+options(width = 60)
+melt_compliance <-
+  PPS %>% 
+  select(pt_reg_no, #control
+         SORT, #control
+         antibiotic_1_compliance_to_guideline, #will be melted
+         antibiotic_2_compliance_to_guideline, #will be melted
+         antibiotic_3_compliance_to_guideline, #will be melted
+         antibiotic_4_compliance_to_guideline) %>% #will be melted
+  melt(id=c("pt_reg_no" , "SORT")) %>% #melt data stratify by pt reg no and SORT
+  arrange(SORT) %>% #re arrange based on SBnumber
+  filter(!is.na(value)) %>% #filter out NA in value column 
+  dplyr::rename(SBNUMBER = pt_reg_no,
+         ABX1 = variable,
+         COMPLIANCE = value) %>% #rename column names
+  select(-c(ABX1)) #remove column ABX1
+
+kable(head(melt_compliance))
+```
+
+## Merge multiple dataframes initially melted
+
+```{r merge multiple dataframes}
+options(width = 60)
+
+final_joined <-
+  bind_cols(melt_abxname, 
+            melt_category$CATEGORY, 
+            melt_indication$INDICATION, 
+            melt_typeind$TYPE_INDICATION,
+            melt_diseasegroup$IND_DIS_GROUP,
+            melt_inddocumented$DOCUMENTED,
+            melt_compliance$COMPLIANCE) #joining multiple df by column (match row by position)
+
+colnames(final_joined) <- 
+  c('SBNUMBER',
+    'SORT',
+    'DISCIPLINE',
+    'ABX_NAME', 
+    'CATEGORY', 
+    'INDICATION', 
+    'TYPE_IND',
+    'DISEASE_GROUP',
+    'INDICATION_DOCUMENTED',
+    'COMPLIANCE') #rename column names
+
+
+head(final_joined) %>%
+  kable() %>%
+  kable_paper(bootstrap_options = "striped", full_width = F, position = "center")
+
+skimr::skim(final_joined)
+
+final_joined <- final_joined %>%
+  mutate(ABX_NAME = str_replace_all(ABX_NAME, "Benzylpenicillin \\(Penicillin G\\)", "Benzylpenicillin")) %>% #Change benzylpenicillin to match with traffic light
+  mutate(ABX_NAME = str_replace_all(ABX_NAME, "Polymyxin E \\(Colistin\\)", "Colistin")) #Change colistin to match with traffic light
+```
+
+# COMBINE OLD & NEW DATA
+
+## Assign traffic_light to ABX
+
+```{r matching traffic light dataset with final_joined}
+
+#create datasets of unique antibiotic list
+unique_ABX <- final_joined %>%
+  distinct(ABX_NAME) %>% 
+  arrange(ABX_NAME)
+
+#load traffic light excel
+traffic <- read_excel("excel/traffic.xlsx")
+
+#full_join both melted data with traffic light & writexl
+ABX_data <- left_join(final_joined, traffic, by = "ABX_NAME")
+
+
+skimr::skim(ABX_data)
+
+#reorder columns and replace all caps abx name & ind_category in column ABX_NAME & CATEGORY
+# factorized traffic lights and indication category
+ABX_data <- ABX_data %>%
+  select(SBNUMBER, ABX_NAME, TF, everything()) %>% 
+  select(-SORT) %>%
+  mutate(ABX_NAME = tolower(ABX_NAME)) %>%
+  mutate(CATEGORY = tolower(CATEGORY)) %>%
+  mutate(INDICATION_DOCUMENTED = tolower(INDICATION_DOCUMENTED)) %>%
+  mutate(TF = factor(TF, levels = c("green", "yellow", "red"))) %>% #change order of traffic light system from green, yellow and red
+  mutate(CATEGORY = factor(CATEGORY, levels = c("definitive therapy", "empirical therapy", "surgical prophylaxis", "non-surgical prophylaxis"))) %>%
+  #change order of indication category
+  mutate(INDICATION_DOCUMENTED = factor(INDICATION_DOCUMENTED, levels = c("yes", "no"))) %>%
+  mutate(Year = latest_year) #add latest  year
+
+#save to excel file
+write_xlsx(ABX_data, paste0("excel/ABXDATA_", latest_year, ".xlsx"))
+
+#double check for missing data/input error
+skimr::skim(ABX_data)
+ABX_n <- nrow(ABX_data)
+
+```
+##verify data and remove unused df
+
+```{r verify data factors}
+
+# Define the columns for which you want to find unique values
+columns <- c("ABX_NAME", "CATEGORY", "TYPE_IND", "DISEASE_GROUP", "INDICATION_DOCUMENTED","COMPLIANCE")
+
+# Loop through each column and find unique values
+for (col in columns) {
+  unique_data <- ABX_data %>%
+  distinct(!!sym(col)) %>% 
+  arrange(!!sym(col))
+  
+  # Store the unique data in a variable with the column name
+  assign(paste0("unique_", col), unique_data)
+}
+
+```
+
+```{r remove df1}
+
+rm(list = ls(pattern = "unique_"))
+rm(list = ls(pattern = "melt_"))
+rm(final_joined, traffic,col, columns)
+```
+
+## Summarizing data for graphs
+
+```{r Summarized data}
+
+#group by abx names
+
+GRAPH_TOTAL_ABX <-
+ABX_data %>%
+  group_by(ABX_NAME) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(percentage =count/sum(count)) %>%
+  mutate(percentage =round(percentage, 3)) 
+
+#group by empirical
+
+GRAPH_TOTAL_ABX_EMPIRICAL <-
+ABX_data %>%
+  group_by(ABX_NAME) %>%
+  filter(CATEGORY == "empirical therapy") %>%
+  summarize(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(percentage =count/sum(count))%>%
+  mutate(percentage =round(percentage, 3))
+
+#group by definitive therapy
+
+GRAPH_TOTAL_ABX_DEFINITIVE <-
+ABX_data %>%
+  group_by(ABX_NAME) %>%
+  filter(CATEGORY == "definitive therapy") %>%
+  summarize(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(percentage =count/sum(count))%>%
+  mutate(percentage =round(percentage, 3))
+
+#group by surgical prophylaxis
+
+GRAPH_TOTAL_ABX_SURGICAL <-
+ABX_data %>%
+  group_by(ABX_NAME) %>%
+  filter(CATEGORY == "surgical prophylaxis") %>%
+  summarize(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(percentage =count/sum(count))%>%
+  mutate(percentage =round(percentage, 3))
+
+#group by indications
+
+GRAPH_TOTAL_IND <- ABX_data %>%
+  mutate(TYPE_IND = str_replace_all(TYPE_IND, c(
+    "Hospital-acquired Pneumonia \\(HAP/VAP\\)" = "HAP/VAP",
+    "Orthopaedic Trauma-related Infections \\(.*?\\)" = "Orthopaedic Trauma Infections",
+    "Others \\(Indication not in guideline\\)" = "Indication NOT in Guideline",
+    "Respiratory Infections" = "Respi Infections (Paeds)",
+    "Surgical Infection - Appendicitis \\(.*?\\)" = "Appendix-related Infections",
+    "Bed Sore / Pressure Sore / Decubitus Ulcer" = "Pressure sores/Ulcers"
+  ))) %>%
+  group_by(TYPE_IND) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(percentage =count/sum(count))%>%
+  mutate(percentage =round(percentage, 3)) 
+  sum(GRAPH_TOTAL_IND$count)
+
+#guideline compliance
+GRAPH_TOTAL_COMPLIANCE <- 
+  ABX_data %>%
+  group_by(DISCIPLINE) %>%
+  filter(COMPLIANCE == "Non-compliance to guidelines") %>%
+  summarize(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(percentage =count/sum(count))%>%
+  mutate(percentage =round(percentage, 3))
+  
+```
+
+## Adding traffic-lights
+
+```{r add TF }
+
+#all abx
+GRAPH_ALL_ABX_TF <-
+  ABX_data %>%
+  group_by(ABX_NAME, TF) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count)) %>%
+  select(ABX_NAME, TF) %>%
+  right_join(GRAPH_TOTAL_ABX, by ="ABX_NAME")
+sum(GRAPH_ALL_ABX_TF$count)
+
+#empirical therapy
+
+GRAPH_empirical_TF <-
+  ABX_data %>%
+  filter(CATEGORY == "empirical therapy") %>%
+  group_by(ABX_NAME, TF) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count)) %>%
+  select(ABX_NAME, TF) %>%
+  right_join(GRAPH_TOTAL_ABX_EMPIRICAL, by ="ABX_NAME")
+
+  #validation of sum 
+  if (sum(GRAPH_empirical_TF$count) != sum(GRAPH_TOTAL_ABX_EMPIRICAL$count)) {
+      stop("Mismatch!")}
+
+#definitive therapy
+GRAPH_definitive_TF <-
+  ABX_data %>%
+  filter(CATEGORY == "definitive therapy") %>%
+  group_by(ABX_NAME, TF) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count)) %>%
+  select(ABX_NAME, TF) %>%
+  right_join(GRAPH_TOTAL_ABX_DEFINITIVE, by ="ABX_NAME")
+
+  #validation of sum 
+  if (sum(GRAPH_definitive_TF$count) != sum(GRAPH_TOTAL_ABX_DEFINITIVE$count)) {
+    stop("Mismatch!")}
+
+#surgical prophylaxis
+
+GRAPH_surgicalprophylaxis_TF <-
+  ABX_data %>%
+  filter(CATEGORY == "surgical prophylaxis") %>%
+  group_by(ABX_NAME, TF) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count)) %>%
+  select(ABX_NAME, TF) %>%
+  right_join(GRAPH_TOTAL_ABX_SURGICAL, by ="ABX_NAME")
+
+  #validation of sum 
+  if (sum(GRAPH_surgicalprophylaxis_TF$count) != sum(GRAPH_TOTAL_ABX_SURGICAL$count)) {
+     stop("Mismatch!")}
+
+#compliance by discipline
+
+GRAPH_compliancevsdiscipline <-
+  ABX_data %>%
+  filter(COMPLIANCE == "Non-compliance to guidelines") %>%
+  group_by(DISCIPLINE, COMPLIANCE) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count)) %>%
+  select(DISCIPLINE, COMPLIANCE) %>%
+  right_join(GRAPH_TOTAL_COMPLIANCE, by ="DISCIPLINE")
+
+
+```
+
+```{r add category}
+
+GRAPH_CAT1 <-
+  ABX_data %>%
+  group_by(CATEGORY, ABX_NAME) %>%
+  summarize(count = n()) %>%
+  arrange(desc(CATEGORY)) %>% 
+  mutate(percentage =count/sum(count)) %>%
+  mutate(percentage =round(percentage, 3))
+
+GRAPH_CAT2 <-
+  GRAPH_CAT1 %>%
+  group_by(ABX_NAME, CATEGORY) %>%
+  summarise(count = sum(count)) %>%  
+  mutate(percent = count/sum(count))
+
+GRAPH_JOINED_CAT<- 
+left_join(GRAPH_TOTAL_ABX, GRAPH_CAT1, by="ABX_NAME")
+```
+
+# DATA VISUALIZATION
+
+## Total Antibiotic Prescribed in PPS
+
+```{r ggplot total abx data}
+
+GRAPH_ALL_ABX_TF %>%
+  mutate(ABX_NAME = stringr::str_to_title(ABX_NAME)) %>% #capitalize each abx names
+  ggplot(aes(x = reorder(ABX_NAME,count), y = percentage, fill = TF)) + 
+  geom_col(color = "black") + 
+  scale_fill_manual(values = c("#00FF00","#FCE205","red")) +
+  geom_vline(xintercept = 22.5, linetype="dashed", #adjust cutoff
+                color = "blue", size=0.5) +
+  coord_flip() + 
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5), size = 3) + 
+  annotate("text", x=23, y=0.15, label="Top 10", angle=0, size = 3) +
+  labs(title = glue("Total ABX prescribed (n = {ABX_n})"),
+       x = "",
+       y = "",
+       fill = "Restriction Category") +
+  scale_y_continuous(labels = percent_format(),
+                     ) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        panel.background = element_rect(fill = "white"),
+        axis.text = element_text(size = 7),
+        legend.text = element_text(size = 7),
+        legend.title = element_text(size = 7),
+        axis.text.y = element_text(size = 8, face = "bold"))
+  
+  ggsave("TOTALABX.tiff", units="in", width=10, height=5, dpi=300, compression = 'lzw', path = "image")
+
+```
+
+## Top 10 Antibiotic Prescribed
+
+```{r ggplot top 10 abx data}
+
+GRAPH_ALL_ABX_TF %>% 
+  ungroup() %>% 
+  mutate(ABX_NAME = stringr::str_to_title(ABX_NAME)) %>% #capitalize each abx names
+  top_n(10, count) %>%
+  ggplot(aes(x = reorder(ABX_NAME,count), y = percentage, fill = TF)) + 
+  geom_col(color = "black") + 
+  scale_fill_manual(values = c("#00FF00","#FCE205","red")) +
+  geom_vline(xintercept = 20.5, linetype="dashed", 
+                color = "blue", size=0.5) +
+  coord_flip() + 
+  geom_text(aes(label = paste0(count, '(', percentage*100,'%)')), position = position_stack(vjust = 0.5), size = 4) +
+  labs(title = "Top 10 Antibiotics prescribed",
+       x = "",
+       y = "",
+       fill = "Restriction Category") +
+  scale_y_continuous(labels = percent_format()) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        panel.background = element_rect(fill = "white"),
+        axis.text = element_text(size = 7),
+        legend.text = element_text(size = 7),
+        legend.title = element_text(size = 7),
+        axis.text.y = element_text(size = 16, face = "bold"))
+  
+  ggsave("TOP10ABX.tiff", units="in", width=10, height=5, dpi=300, compression = 'lzw', path = "image")
+
+```
+
+## Top 10 Empirical Antibiotics
+
+```{r ggplot abx data empirical}
+  #
+GRAPH_empirical_TF%>%
+  ungroup() %>% 
+  mutate(ABX_NAME = stringr::str_to_title(ABX_NAME)) %>% #capitalize each abx names
+  top_n(n=10, count) %>%
+  ggplot(aes(x = reorder(ABX_NAME,count), y = percentage, fill = TF)) + 
+  geom_col(color = "black") + 
+  scale_fill_manual(values = c("#00FF00","#FCE205","red")) +
+  geom_vline(xintercept = 20.5, linetype="dashed", 
+                color = "blue", size=0.5) +
+  coord_flip() + 
+  geom_text(aes(label = paste0(count, '(', percentage*100,'%)')), position = position_stack(vjust = 0.5), size = 4) +
+  labs(title = "Top 10 Empirical Antibiotics",
+       x = "",
+       y = "",
+       fill = "Restriction Category") +
+  scale_y_continuous(labels = percent_format()) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        panel.background = element_rect(fill = "white"),
+        axis.text = element_text(size = 7),
+        legend.text = element_text(size = 7),
+        legend.title = element_text(size = 7),
+        axis.text.y = element_text(size = 16))
+
+  ggsave("TOP10EMPABX.tiff", units="in", width=10, height=5, dpi=300, compression = 'lzw', path = "image")
+
+```
+
+## Definitve Antibiotics
+
+```{r ggplot abx data definitive}
+
+GRAPH_definitive_TF%>%
+  ungroup() %>% 
+  mutate(ABX_NAME = stringr::str_to_title(ABX_NAME)) %>% #capitalize each abx names
+  top_n(n=10, count) %>%
+  ggplot(aes(x = reorder(ABX_NAME,count), y = percentage, fill = TF)) + 
+  geom_col(color = "black") + 
+  scale_fill_manual(values = c("#00FF00","#FCE205","red")) +
+  geom_vline(xintercept = 20.5, linetype="dashed", 
+                color = "blue", size=0.5) +
+  coord_flip() + 
+  geom_text(aes(label = paste0(count, '(', percentage*100,'%)')), position = position_stack(vjust = 0.5), size = 4) +
+  labs(title = "Top 10 Definitive Antibiotics",
+       x = "",
+       y = "",
+       fill = "Restriction Category") +
+  scale_y_continuous(labels = percent_format()) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        panel.background = element_rect(fill = "white"),
+        axis.text = element_text(size = 7),
+        legend.text = element_text(size = 7),
+        legend.title = element_text(size = 7),
+        axis.text.y = element_text(size = 16, face = "bold"))
+
+ggsave("TOP10DEFABX.tiff", units="in", width=10, height=5, dpi=300, compression = 'lzw', path = "image")
+
+```
+
+## Surgical Prophylaxis
+
+```{r surgical prop abx}
+
+GRAPH_surgicalprophylaxis_TF %>%
+  mutate(ABX_NAME = stringr::str_to_title(ABX_NAME)) %>% #capitalize each abx names
+  ggplot(aes(x = reorder(ABX_NAME,count), y = percentage, fill = TF)) + 
+  geom_col(color = "black") + 
+  scale_fill_manual(values = c("#00FF00","#FCE205","red")) +
+    geom_vline(xintercept = 20.5, linetype="dashed", 
+                color = "blue", size=0.5) +
+  coord_flip() + 
+  geom_text(aes(label = paste0(count, '(', percentage*100,'%)')), position = position_stack(vjust = 0.5), size = 4) +
+  labs(title = "Surgical Prophylaxis Antibiotics",
+       x = "",
+       y = "",
+       fill = "Restriction Category") +
+  scale_y_continuous(labels = percent_format()) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        panel.background = element_rect(fill = "white"),
+        axis.text = element_text(size = 7),
+        legend.text = element_text(size = 7),
+        legend.title = element_text(size = 7),
+        axis.text.y = element_text(size = 16, face = "bold"))
+
+
+  ggsave("TOP10SURG.tiff", units="in", width=10, height=5, dpi=300, compression = 'lzw', path = "image")
+```
+
+## Top Antibiotic Prescriber PPS
+
+```{r discipline}
+
+GRAPH_Discpline1 <-
+ABX_data %>% 
+  mutate(DISCIPLINE = str_replace(DISCIPLINE, "COVID General Adults", "Infectious Disease")) %>%
+  group_by(DISCIPLINE) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(percentage =count/sum(count))
+sum(GRAPH_Discpline1$count) 
+    
+GRAPH_Discpline1 %>%
+  ggplot(aes(x = reorder(DISCIPLINE,count), y = percentage, fill = DISCIPLINE)) + 
+  geom_col(color = "black") + 
+  scale_x_discrete(labels = ~ ifelse(.x == "Infectious Disease", paste0(.x, "*"), .x)) +
+  coord_flip() + 
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  labs(title = "Top Antibiotic prescriber",
+       x = "",
+       y = "") +
+  scale_y_continuous(labels = percent_format()) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        panel.background = element_rect(fill = "white"),
+        legend.position = "none",
+        axis.text = element_text(size = 7),
+        legend.text = element_text(size = 7),
+        legend.title = element_text(size = 7),
+        axis.text.y = element_text(size = 12, face = "bold"),
+        plot.caption = element_text(hjust = 1))
+  ggsave("TOPPRESCRIBER.tiff", units="in", width=10, height=5, dpi=300, compression = 'lzw', path = "image")
+
+  
+```
+
+## Top 10 Antibiotic by Indication Category
+
+```{r ggplot top 10 abx data by cat}
+
+GRAPH_CAT1%>% 
+  mutate(CATEGORY = factor(CATEGORY, levels = c("non-surgical prophylaxis", "surgical prophylaxis","definitive therapy","empirical therapy"))) %>%
+  semi_join(
+    ABX_data %>%
+      count(ABX_NAME, sort = TRUE) %>%
+      slice_head(n = 10),
+    by = "ABX_NAME"
+  ) %>%
+  mutate(ABX_NAME = stringr::str_to_title(ABX_NAME)) %>% #capitalize each abx names
+    
+  ggplot(aes(x = fct_reorder(ABX_NAME, count, sum), y = count, fill = CATEGORY)) + 
+  geom_col(color = "black") +
+  scale_fill_manual(values = c("#C3B1E1","#7EC8E3","#76B947","#E7625F")) +
+  #geom_vline(xintercept = 20.5, linetype="dashed", 
+                #color = "blue", size=0.5) +
+  coord_flip() + 
+  geom_text(aes(label = ifelse(count >= 2, count,"")), position = position_stack(vjust = 0.5), size = 4) +
+  labs(title = "Top 10 Antibiotics prescribed",
+       x = "",
+       y = "",
+       fill = "Category") +
+ theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+       panel.background = element_rect(fill = "white"),
+       axis.text = element_text(size = 7),
+       legend.text = element_text(size = 7),
+       legend.title = element_text(size = 7),
+       axis.text.y = element_text(size = 12, face = "bold")) 
+       
+ggsave("TOP10ABX2.tiff", units="in", width=10, height=5, dpi=300, compression = 'lzw', path = "image")
+
+```
+
+## Top 10 Antibiotic by indication category (visualize by %)
+
+```{r top10abxbyIND_Cat}
+
+GRAPH_CAT2 %>%
+  mutate(CATEGORY = factor(CATEGORY, levels = c("non-surgical prophylaxis", "surgical prophylaxis","definitive therapy","empirical therapy"))) %>%
+  semi_join(
+    ABX_data %>%
+      count(ABX_NAME, sort = TRUE) %>%
+      slice_head(n = 10),
+    by = "ABX_NAME"
+  ) %>%
+  mutate(ABX_NAME = stringr::str_to_title(ABX_NAME)) %>% #capitalize each abx names
+  
+ggplot(aes(x= fct_reorder(ABX_NAME, count, sum), y = percent, fill = CATEGORY)) + 
+  geom_col(color = "black") +
+  scale_fill_manual(values = c("#C3B1E1","#7EC8E3","#76B947","#E7625F")) +
+  coord_flip() + 
+  geom_text(aes(label=ifelse(percent >= 0.14, paste0(count, " (",sprintf("%.0f", percent*100),"%",")"),"")), position = position_stack(vjust = 0.5), size = 4) +
+  labs(title = "Top 10 Antibiotics prescribed",
+       x = "",
+       y = "",
+       fill = "Category") +
+ theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+       panel.background = element_rect(fill = "white"),
+       axis.text = element_text(size = 7),
+       legend.text = element_text(size = 7),
+       legend.title = element_text(size = 7),
+       axis.text.y = element_text(size = 12, face = "bold")) +
+ scale_y_continuous(labels = percent_format()) +
+ scale_x_discrete(position = "bottom")
+
+ggsave("TOP10ABX3.tiff", units="in", width=10, height=5, dpi=300, compression = 'lzw', path = "image")
+
+```
+
+## Top 10 Indication of antibiotic prescription
+
+```{r}
+
+GRAPH_TOTAL_IND %>%
+  head(10) %>%
+  ggplot(aes(x = reorder(TYPE_IND,count), y = percentage)) + 
+  geom_col(aes(fill = count), stat = "identity") + 
+  scale_fill_gradient2(low = "white", 
+                       high = "red") + 
+  scale_x_discrete(label = function(x) str_wrap(x, width = 20)) +
+  coord_flip() + 
+  geom_text(aes(label = paste0(count, '(', percentage*100,'%)')), position = position_stack(vjust = 0.5), size = 4) +
+  labs(title = glue("Total ABX prescribed (n = {ABX_n})"),
+       x = "",
+       y = "") +
+  scale_y_continuous(labels = percent_format()) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        panel.background = element_rect(fill = "white"),
+        legend.position = "none",
+        axis.text = element_text(size = 7),
+        legend.text = element_text(size = 7),
+        legend.title = element_text(size = 7),
+        plot.margin = unit(c(0, 0, 0, 0), "in"),
+        axis.text.y = element_text(size = 10,
+                                   face = "bold"))
+ggsave("TOPIND.tiff", units="in", width=10, height=5, dpi=300, compression = 'lzw', path = "image")
+
+```
+
+## Compliance rate by prescriber (graph)
+
+```{r compliance by prescriber per abx}
+
+GRAPH_compliancevsdiscipline %>%
+  ggplot(aes(x = reorder(DISCIPLINE,count), y = percentage, fill = DISCIPLINE)) + 
+  geom_col(color = "black") + 
+  scale_x_discrete(labels = ~ ifelse(.x == "Infectious Disease", paste0(.x, "*"), .x)) +
+  coord_flip() + 
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  labs(title = "NON COMPLIANCE BY DISCIPLINE (BY ABX)",
+       x = "",
+       y = "") +
+  scale_y_continuous(labels = percent_format()) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        panel.background = element_rect(fill = "white"),
+        legend.position = "none",
+        axis.text = element_text(size = 7),
+        legend.text = element_text(size = 7),
+        legend.title = element_text(size = 7),
+        axis.text.y = element_text(size = 12, face = "bold"),
+        plot.caption = element_text(hjust = 1))
+  ggsave("TOPNONCOMPLIANCE.tiff", units="in", width=10, height=5, dpi=300, compression = 'lzw', path = "image")
+ 
+```
+
+## Compliance rate by prescriber (graph)
+
+```{r compliance by prescriber by patient}
+
+GRAPH_TOTAL_COMPLIANCE_PT <- 
+  PPS %>%
+  group_by(discipline) %>%
+  filter(overall_compliance_to_antibiotic_guideline == "Not-compliant to guidelines") %>%
+  summarize(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(percentage =count/sum(count))%>%
+  mutate(percentage =round(percentage, 3))
+
+GRAPH_compliancebypatient <-
+  PPS %>%
+  filter(overall_compliance_to_antibiotic_guideline == "Not-compliant to guidelines") %>%
+  group_by(discipline, overall_compliance_to_antibiotic_guideline) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count)) %>%
+  select(discipline, overall_compliance_to_antibiotic_guideline) %>%
+  right_join(GRAPH_TOTAL_COMPLIANCE_PT, by ="discipline")
+
+GRAPH_compliancebypatient %>%
+  ggplot(aes(x = reorder(discipline,count), y = percentage, fill = discipline)) + 
+  geom_col(color = "black") + 
+  scale_x_discrete(labels = ~ ifelse(.x == "Infectious Disease", paste0(.x, "*"), .x)) +
+  coord_flip() + 
+  geom_text(aes(label = count), position = position_stack(vjust = 0.5)) +
+  labs(title = "NON COMPLIANCE BY DISCIPLINE (BY PT)",
+       x = "",
+       y = "") +
+  scale_y_continuous(labels = percent_format()) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        panel.background = element_rect(fill = "white"),
+        legend.position = "none",
+        axis.text = element_text(size = 7),
+        legend.text = element_text(size = 7),
+        legend.title = element_text(size = 7),
+        axis.text.y = element_text(size = 12, face = "bold"),
+        plot.caption = element_text(hjust = 1))
+  ggsave("TOPNONCOMPLIANCEBYPT.tiff", units="in", width=10, height=5, dpi=300, compression = 'lzw', path = "image")
+ 
+```
+```{r remove graph DF}
+rm(list = ls(pattern = "GRAPH_"))
+```
+
+
+# YEARLY COMPARISON
+
+## Load Data Frame into R
+
+Combine PPSFINALbyABX from previous year to current year
+```{r combine PPSbyABX sheet}
+#load available prevalence_analysis.xlsx
+existing_PPSbyABX <- read_excel(paste0("excel/FINALPPSbyABX_", second_latest_year, ".xlsx"))
+
+#join existing + new prevalence analysis into one spreadsheet
+combined_ABX_data <- bind_rows(existing_PPSbyABX, ABX_data)
+
+#save to excel sheet
+write_xlsx(combined_ABX_data, paste0("excel/FINALPPSbyABX_", latest_year, ".xlsx"))
+
+rm(existing_PPSbyABX)
+```
+
+
+```{r wrangle all df}
+#mutate factor
+combined_prev_analysis <-
+combined_prev_analysis %>%
+  mutate(Abx_prescribed = factor(Abx_prescribed, levels = c("yes", "no"))) #change order of Yes & No
+
+ #mutate factor
+combined_ABX_data <-
+  combined_ABX_data %>%
+  mutate(INDICATION_DOCUMENTED = factor(INDICATION_DOCUMENTED, levels = c("yes", "no"))) %>% #change order of Yes & No
+  mutate(Empirical = case_when(
+    CATEGORY == "empirical therapy" ~ "yes",
+    TRUE ~ "no"  # For all other cases
+  )) %>%
+  mutate(Empirical = factor(Empirical, levels = c("yes", "no")))#change order of Yes & No
+
+```
+
+### Comparison antibiotics
+
+```{r antibiotic latest year vs prev year}
+
+COMPARE_df <- ABX_data %>%
+  count(ABX_NAME, sort = TRUE) %>%
+  slice_head(n = 10) %>%
+  mutate(number = row_number()) %>%
+  select(-n)
+
+COMPARE_ABX_COMPARE <- combined_ABX_data %>%
+  select(Year, ABX_NAME) %>%
+  mutate(across(where(is.character),tolower)) %>%
+  filter(Year %in% sort(unique(Year), decreasing = TRUE)[1:2]) %>%
+  group_by(Year) %>%
+  count(ABX_NAME, sort = TRUE) %>% 
+  mutate(percentage =n/sum(n)) %>%
+  mutate(percentage =round(percentage, 3)) %>%
+  mutate(percentage =ifelse(Year == latest_year,percentage, -1*percentage)) %>%
+  mutate(Year = factor(Year, levels = c(latest_year, second_latest_year))) %>%
+  filter(ABX_NAME %in% COMPARE_df$ABX_NAME)
+
+COMPARE_joined_abx_compare <- left_join(COMPARE_ABX_COMPARE, COMPARE_df, by = "ABX_NAME")
+
+COMPARE_joined_abx_compare %>%
+  ggplot(aes(x = reorder(ABX_NAME, -number), y = percentage, fill = Year)) + 
+  geom_col(color = "black") + 
+  geom_hline(yintercept = 0) +
+  coord_flip() +
+  geom_text(aes(label = paste0(n, '(', abs(percentage*100),'%)')), position = position_stack(vjust = 0.5), size = 2.5, check_overlap = TRUE) +
+  labs(title = glue("Top ABX ({latest_year} vs {second_latest_year})"),
+       x = "",
+       y = "",
+       fill = "Year") +
+  scale_y_continuous(labels = function(x) percent(abs(x))) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        panel.background = element_rect(fill = "white"),
+        axis.text = element_text(size = 7),
+        legend.text = element_text(size = 7),
+        legend.title = element_text(size = 7),
+        axis.text.y = element_text(size = 12, face = "bold"))
+
+ggsave("TOTALABXbyYEAR.tiff", units="in", width=10, height=5, dpi=300, compression = 'lzw', path = "image")
+```
+
+### Comparison prescriber
+
+```{r discipline by year}
+
+disc_df1 <- ABX_data %>%
+  count(DISCIPLINE, sort = TRUE) %>%
+  slice_head(n = 9) %>%
+  mutate(number = row_number()) %>% 
+  rename(Discipline = DISCIPLINE) %>%
+  select(-n)
+
+disc_COMPARE <-combined_ABX_data %>%
+  select(Year, DISCIPLINE) %>%
+  rename(Discipline = DISCIPLINE) %>% 
+  filter(Year %in% sort(unique(Year), decreasing = TRUE)[1:2]) %>%
+  group_by(Year) %>%
+  count(Discipline, sort = TRUE) %>% 
+  mutate(percentage =n/sum(n)) %>%
+  mutate(percentage =round(percentage, 3)) %>%
+  mutate(percentage =ifelse(Year == latest_year,percentage, -1*percentage)) %>%
+  mutate(Year = factor(Year))  %>%
+  filter(Discipline %in% disc_df1$Discipline)
+
+disc_joined_prescriber <- left_join(disc_COMPARE, disc_df1, by = "Discipline")
+
+disc_joined_prescriber %>% 
+  ggplot(aes(x = reorder(Discipline, -number), y = percentage, fill = Year)) + 
+  geom_col(color = "black") + 
+  geom_hline(yintercept = 0) +
+  coord_flip() +
+  geom_text(aes(label = paste0(n, '(', abs(percentage*100),'%)')), position = position_stack(vjust = 0.5), size = 2.5, check_overlap = TRUE) +
+  labs(title = glue("Top Prescriber ({latest_year} vs {second_latest_year})"),
+       x = "",
+       y = "",
+       fill = "Year") +
+  scale_y_continuous(labels = function(x) percent(abs(x))) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        panel.background = element_rect(fill = "white"),
+        axis.text = element_text(size = 7),
+        legend.text = element_text(size = 7),
+        legend.title = element_text(size = 7),
+        axis.text.y = element_text(size = 12, face = "bold"))
+ggsave("TOPPRESCRIBERbyYEAR.tiff", units="in", width=10, height=5, dpi=300, compression = 'lzw', path = "image") 
+```
+
+# DATA ANALYSIS/INFERENTIAL STATISTICS - compare with previous year
+
+## wrangling
+
+```{r Discipline}
+
+disc_med <-
+  combined_ABX_data %>%
+  select(Year, DISCIPLINE) %>%
+  rename(Discipline = DISCIPLINE) %>%
+  mutate(Discp = ifelse(Discipline == "General Medical", "Medical", "Non-Medical")) %>%
+  select(Year, Discp) %>%
+  filter(Year %in% sort(unique(Year), decreasing = TRUE)[1:2])
+
+disc_ortho <-
+  combined_ABX_data %>%
+  select(Year, DISCIPLINE) %>%
+  rename(Discipline = DISCIPLINE) %>%
+  mutate(Discp = ifelse(Discipline == "Orthopaedic", "Ortho", "Non-ortho")) %>%
+  select(Year, Discp) %>%
+  filter(Year %in% sort(unique(Year), decreasing = TRUE)[1:2])
+
+disc_Paeds <-
+  combined_ABX_data %>%
+  select(Year, DISCIPLINE) %>%
+  rename(Discipline = DISCIPLINE) %>%
+  mutate(Discp = ifelse(Discipline == "Paediatric", "Paeds", "Non-Paeds")) %>%
+  select(Year, Discp) %>%
+  filter(Year %in% sort(unique(Year), decreasing = TRUE)[1:2])
+ 
+disc_OnG <-
+  combined_ABX_data %>%
+  select(Year, DISCIPLINE) %>%
+  rename(Discipline = DISCIPLINE) %>%
+  mutate(Discp = ifelse(Discipline == "O&G", "O&G", "Non-O&G")) %>%
+  select(Year, Discp)%>%
+  filter(Year %in% sort(unique(Year), decreasing = TRUE)[1:2])
+
+disc_icu <-
+  combined_ABX_data %>%
+  select(Year, DISCIPLINE) %>%
+  rename(Discipline = DISCIPLINE) %>%
+  mutate(Discp = ifelse(Discipline == "Intensive Care Unit", "ICU", "Non-ICU")) %>%
+  select(Year, Discp) %>%
+  filter(Year %in% sort(unique(Year), decreasing = TRUE)[1:2])
+
+disc_ID <-
+  combined_ABX_data %>%
+  select(Year, DISCIPLINE) %>%
+  rename(Discipline = DISCIPLINE) %>%
+  mutate(Discp = ifelse(Discipline == "Infectious Disease", "ID", "Non-ID")) %>%
+  select(Year, Discp) %>%
+  filter(Year %in% sort(unique(Year), decreasing = TRUE)[1:2])
+
+disc_neonate <-
+  combined_ABX_data %>%
+  select(Year, DISCIPLINE) %>%
+  rename(Discipline = DISCIPLINE) %>%
+  mutate(Discp = ifelse(Discipline == "Neonates/NICU", "Neonates", "Non-Neonates")) %>%
+  select(Year, Discp) %>%
+  filter(Year %in% sort(unique(Year), decreasing = TRUE)[1:2])
+
+disc_gensurg <-
+  combined_ABX_data %>%
+  select(Year, DISCIPLINE) %>%
+  rename(Discipline = DISCIPLINE) %>%
+  mutate(Discp = ifelse(Discipline == "General Surgical", "Gen-Surgical", "Non Gen-Surg")) %>%
+  select(Year, Discp) %>%
+  filter(Year %in% sort(unique(Year), decreasing = TRUE)[1:2])
+
+disc_plastic <-
+  combined_ABX_data %>%
+  select(Year, DISCIPLINE) %>%
+  rename(Discipline = DISCIPLINE) %>%
+  mutate(Discp = ifelse(Discipline == "Plastic & Reconstructive Surgery", "Plastic", "Non plastic")) %>%
+  select(Year, Discp) %>%
+  filter(Year %in% sort(unique(Year), decreasing = TRUE)[1:2])
+```
+
+## Generate tbl_summary
+
+```{r Comparison by Discipline from prev year using tbl_summary}
+
+disc_med %>%
+tbl_summary(by = Year, 
+              type = list(Discp ~ "categorical"),
+              label = Discp ~ "Discipline") %>%
+  modify_header(label ~ " ") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Year**") %>%
+  bold_labels() %>%
+  add_p()
+
+disc_ortho %>%
+tbl_summary(by = Year, 
+              type = list(Discp ~ "categorical"),
+              label = Discp ~ "Discipline") %>%
+  modify_header(label ~ " ") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Year**") %>%
+  bold_labels() %>%
+  add_p()
+
+disc_Paeds %>%
+tbl_summary(by = Year, 
+              type = list(Discp ~ "categorical"),
+              label = Discp ~ "Discipline") %>%
+  modify_header(label ~ " ") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Year**") %>%
+  bold_labels() %>%
+  add_p()
+
+disc_OnG %>%
+tbl_summary(by = Year, 
+              type = list(Discp ~ "categorical"),
+              label = Discp ~ "Discipline") %>%
+  modify_header(label ~ " ") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Year**") %>%
+  bold_labels() %>%
+  add_p()
+
+disc_icu %>%
+tbl_summary(by = Year, 
+              type = list(Discp ~ "categorical"),
+              label = Discp ~ "Discipline") %>%
+  modify_header(label ~ " ") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Year**") %>%
+  bold_labels() %>%
+  add_p()
+
+disc_ID %>%
+tbl_summary(by = Year, 
+              type = list(Discp ~ "categorical"),
+              label = Discp ~ "Discipline") %>%
+  modify_header(label ~ " ") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Year**") %>%
+  bold_labels() %>%
+  add_p()
+
+disc_neonate %>%
+tbl_summary(by = Year, 
+              type = list(Discp ~ "categorical"),
+              label = Discp ~ "Discipline") %>%
+  modify_header(label ~ " ") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Year**") %>%
+  bold_labels() %>%
+  add_p()
+
+disc_gensurg %>%
+tbl_summary(by = Year, 
+              type = list(Discp ~ "categorical"),
+              label = Discp ~ "Discipline") %>%
+  modify_header(label ~ " ") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Year**") %>%
+  bold_labels() %>%
+  add_p()
+
+disc_plastic %>%
+tbl_summary(by = Year, 
+              type = list(Discp ~ "categorical"),
+              label = Discp ~ "Discipline") %>%
+  modify_header(label ~ " ") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Year**") %>%
+  bold_labels() %>%
+  add_p()
+```
+
+## Comparison Table & Cross-Tab by year
+
+```{r Comparison Table & Cross-Tab}
+
+TABLE_PREVALENCE <- combined_prev_analysis %>%
+  filter(Year %in% sort(unique(Year), decreasing = TRUE)[1:2]) %>%
+  select(Year, Abx_prescribed) %>% 
+  tbl_summary(by = Year, 
+              type = all_dichotomous() ~ "categorical",
+              label = Abx_prescribed ~ "Patients on Antibiotics") %>%
+  modify_header(label ~ " ") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Year**") %>%
+  bold_labels() %>%
+  add_p()
+
+TABLE_INDDOCUMENTED <- combined_ABX_data %>% 
+  filter(Year %in% sort(unique(Year), decreasing = TRUE)[1:2]) %>%
+  select(Year, INDICATION_DOCUMENTED) %>%
+  tbl_summary(by = Year, 
+              type = all_dichotomous() ~ "categorical",
+              label = INDICATION_DOCUMENTED ~ "Indication Documented") %>%
+  modify_header(label ~ " ") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Year**") %>%
+  bold_labels() %>%
+  add_p()
+
+TABLE_BYYEARINDDOC <- combined_ABX_data %>% 
+  filter(Year %in% sort(unique(Year), decreasing = TRUE)[1:2]) %>%
+  select(Year, INDICATION_DOCUMENTED) %>%
+  tbl_cross(row = Year, col = INDICATION_DOCUMENTED, percent = "cell") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Indication Documentation**") %>%
+  add_p() %>%
+  bold_labels()
+
+TABLE_EMPIRICAL <- combined_ABX_data %>% 
+  filter(Year %in% sort(unique(Year), decreasing = TRUE)[1:2]) %>%
+  select(Year, Empirical) %>%
+  tbl_cross(row = Year, col = Empirical, percent = "cell") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Empirical**") %>%
+  add_p() %>%
+  bold_labels()
+
+TABLE_PREVALENCE
+TABLE_INDDOCUMENTED
+TABLE_BYYEARINDDOC
+TABLE_EMPIRICAL
+
+# List of tables
+table_list <- c("TABLE_PREVALENCE", "TABLE_INDDOCUMENTED", "TABLE_BYYEARINDDOC", "TABLE_EMPIRICAL")
+
+# Function to save each table
+save_table_as_docx <- function(i) {
+  table_obj <- get(i) %>%
+    as_flex_table()
+  
+  file_path <- paste0("table/", tolower(i), ".docx")
+  flextable::save_as_docx(table_obj, path = file_path)
+  
+  message("✅ Saved: ", file_path)
+}
+
+# Apply function to all tables
+lapply(table_list, save_table_as_docx)
+
+```
+
+```{r remove df2}
+rm(list = ls(pattern = "disc_"))
+rm(list = ls(pattern = "COMPARE_"))
+rm(list = ls(pattern = "TABLE"))
+```
+
+# THE END
